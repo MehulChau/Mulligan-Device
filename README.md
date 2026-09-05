@@ -45,8 +45,16 @@ python test.py       # run the full accuracy sweep; exits non-zero on failure
 ```
 
 `generate_frame()` also accepts `noise_sigma` (Gaussian sensor noise), `flash_duration_us` (motion
-smear from a non-instantaneous flash), and `ir_falloff` (inverse-square dimming with distance from the
-strobe) to exercise the detector against harder, more realistic frames.
+smear from a non-instantaneous flash), `ir_falloff` (inverse-square dimming with distance from the
+strobe), `laser_dot` / `mat_reflection` / `clubhead_edge` (distractors a real range frame can contain),
+and `missing_flash_index` (a strobe pulse that didn't fire) to exercise the detector against harder,
+more realistic frames.
+
+Known gap: `laser_dot` and an isolated round `mat_reflection` currently survive the area/circularity
+filters that are meant to reject non-ball blobs -- neither filter checks a candidate's size against the
+expected ball diameter, so a small, bright, round distractor reads as a valid ball image and can badly
+corrupt a measurement. `test.py`'s `check_distractors` reports this as a known limitation rather than
+asserting it away.
 
 ## How the scale is derived
 
