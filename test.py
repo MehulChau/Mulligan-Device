@@ -117,23 +117,108 @@ def check_clipped_ball_exclusion():
     return passed
 
 
-def check_nonzero_background():
-    """A constant non-zero background must not bias area or centroid."""
-    speed_mph, angle_deg, num_flashes = 100.0, 20.0, 5
-    image, truth = generate_frame(speed_mph, angle_deg, num_flashes=num_flashes)
+BACKGROUND_LEVEL = 25
+NOISE_TRIALS = 20
 
-    background_level = 25
-    noisy = np.clip(image.astype(np.int16) + background_level, 0, 255).astype(np.uint8)
+
+def check_nonzero_background():
+    """A constant non-zero background, with noise, must not bias area or
+    centroid beyond the accuracy threshold. Unlike a bare constant offset,
+    this exercises the fragile path a plain `roi.max()` peak estimate would
+    have broken on -- the robust plateau fix (median of pixels above half
+    the observed max) is what keeps this passing."""
+    speed_mph, angle_deg, num_flashes = 100.0, 20.0, 5
+    # sigma=8 is right at the 0.5% threshold (see report_noise_sensitivity)
+    # and not a stable pass/fail gate; sigma=3 is comfortably within it.
+    noise_sigma = 3.0
+    image, truth = generate_frame(speed_mph, angle_deg, num_flashes=num_flashes, noise_sigma=noise_sigma)
+    noisy = np.clip(image.astype(np.int16) + BACKGROUND_LEVEL, 0, 255).astype(np.uint8)
 
     result = measure(noisy, truth["strobe_interval_ms"])
-    assert result is not None, "detector failed against a non-zero background"
+    assert result is not None, "detector failed against a non-zero background + noise"
 
     speed_err_pct = abs(result["ball_speed_mph"] - speed_mph) / speed_mph * 100.0
     angle_err_deg = abs(result["launch_angle_deg"] - angle_deg)
-    print(f"non-zero background (level {background_level}): "
+    print(f"non-zero background (level {BACKGROUND_LEVEL}) + noise (sigma {noise_sigma}): "
           f"speed error {speed_err_pct:.3f}%, angle error {angle_err_deg:.3f} deg")
 
     passed = speed_err_pct <= SPEED_ERROR_THRESHOLD_PCT and angle_err_deg <= ANGLE_ERROR_THRESHOLD_DEG
+    print("PASS" if passed else "FAIL")
+    return passed
+
+
+def report_noise_sensitivity():
+    """Diagnostic only (not a pass/fail gate): sweep noise sigma with a
+    constant background present and report where accuracy degrades."""
+    speed_mph, angle_deg, num_flashes = 150.0, 12.0, 4
+    print(f"noise sensitivity (background level {BACKGROUND_LEVEL}, {NOISE_TRIALS} trials/level):")
+    for sigma in (0.0, 3.0, 8.0, 15.0):
+        errs = []
+        fails = 0
+        for _ in range(NOISE_TRIALS):
+            image, truth = generate_frame(
+                speed_mph, angle_deg, num_flashes=num_flashes, noise_sigma=sigma,
+            )
+            noisy = np.clip(image.astype(np.int16) + BACKGROUND_LEVEL, 0, 255).astype(np.uint8)
+            result = measure(noisy, truth["strobe_interval_ms"])
+            if result is None:
+                fails += 1
+                continue
+            errs.append(abs(result["ball_speed_mph"] - speed_mph) / speed_mph * 100.0)
+        if errs:
+            print(f"  sigma={sigma:5.1f}: mean err={np.mean(errs):.3f}%  "
+                  f"max err={np.max(errs):.3f}%  detect fails={fails}/{NOISE_TRIALS}")
+        else:
+            print(f"  sigma={sigma:5.1f}: all {NOISE_TRIALS} detections failed")
+
+
+def check_motion_smear():
+    """Motion smear stretches a blob along the direction of travel, biasing
+    an area-based diameter estimate. Deriving scale from each blob's extent
+    perpendicular to the fitted flight line should be immune to it."""
+    passed = True
+    for name, speed_mph, angle_deg, num_flashes in (("driver", 150.0, 12.0, 4), ("wedge", 86.0, 26.0, 4)):
+        flash_duration_us = 30.0
+        image, truth = generate_frame(
+            speed_mph, angle_deg, num_flashes=num_flashes, flash_duration_us=flash_duration_us,
+        )
+        result = measure(image, truth["strobe_interval_ms"])
+        assert result is not None, f"detector failed on a smeared {name} shot"
+
+        speed_err_pct = abs(result["ball_speed_mph"] - speed_mph) / speed_mph * 100.0
+        print(f"motion smear ({name}, {truth['smear_px']:.2f}px @ {flash_duration_us}us): "
+              f"speed error {speed_err_pct:.4f}%")
+        passed &= speed_err_pct <= SPEED_ERROR_THRESHOLD_PCT
+
+    print("PASS" if passed else "FAIL")
+    return passed
+
+
+def check_ir_falloff():
+    """IR falloff dims far balls enough that a single global threshold
+    misses them outright. Report that failure, then confirm the adaptive
+    (multi-threshold) detector recovers."""
+    speed_mph, angle_deg, num_flashes = 150.0, 12.0, 4
+    image, truth = generate_frame(
+        speed_mph, angle_deg, num_flashes=num_flashes, ir_falloff=True,
+    )
+    intensities = [b["intensity"] for b in truth["balls"]]
+    print(f"IR falloff ball intensities (0-255): {[f'{v:.1f}' for v in intensities]}")
+
+    global_result = measure(image, truth["strobe_interval_ms"], threshold=40, adaptive=False)
+    if global_result is None:
+        print("global threshold=40: detection FAILED (fewer than 3 ball images found), as expected")
+    else:
+        print(f"global threshold=40: detection unexpectedly succeeded "
+              f"({global_result['num_ball_images']} blobs)")
+
+    adaptive_result = measure(image, truth["strobe_interval_ms"], threshold=40, adaptive=True)
+    assert adaptive_result is not None, "adaptive detector failed to recover under IR falloff"
+    speed_err_pct = abs(adaptive_result["ball_speed_mph"] - speed_mph) / speed_mph * 100.0
+    print(f"adaptive threshold: {adaptive_result['num_ball_images']} blobs found, "
+          f"speed error {speed_err_pct:.3f}%")
+
+    passed = speed_err_pct <= SPEED_ERROR_THRESHOLD_PCT
     print("PASS" if passed else "FAIL")
     return passed
 
@@ -144,8 +229,14 @@ def main():
     clip_ok = check_clipped_ball_exclusion()
     print()
     background_ok = check_nonzero_background()
+    print()
+    report_noise_sensitivity()
+    print()
+    smear_ok = check_motion_smear()
+    print()
+    falloff_ok = check_ir_falloff()
 
-    if not (sweep_ok and clip_ok and background_ok):
+    if not (sweep_ok and clip_ok and background_ok and smear_ok and falloff_ok):
         sys.exit(1)
 
 

@@ -40,9 +40,13 @@ source .venv/bin/activate
 pip install opencv-python numpy
 
 python generate.py   # writes frame.png / frame.json for a single example shot
-python detect.py frame.png 2.9   # measure a single frame (image path, strobe interval in ms)
+python detect.py frame.png 2.2   # measure a single frame (image path, strobe interval in ms)
 python test.py       # run the full accuracy sweep; exits non-zero on failure
 ```
+
+`generate_frame()` also accepts `noise_sigma` (Gaussian sensor noise), `flash_duration_us` (motion
+smear from a non-instantaneous flash), and `ir_falloff` (inverse-square dimming with distance from the
+strobe) to exercise the detector against harder, more realistic frames.
 
 ## How the scale is derived
 
@@ -50,6 +54,12 @@ The naive approach — assume the ball is exactly 0.6 m from the lens and use a 
 constant — breaks badly if the ball is placed a few centimeters off that assumed distance: a 5 cm
 error is an ~8% scale error, i.e. ~12 mph of speed error on a driver swing.
 
-Instead, `detect.py` derives the scale from the ball's known real diameter (42.67 mm) and its measured
-diameter in pixels, averaged across every ball image in the frame. This self-calibrates on every shot
-and makes the camera-to-ball distance irrelevant to the measurement.
+Instead, `detect.py` derives the scale from the ball's known real diameter (42.67 mm), fitting the
+flight line through the ball centres first and then measuring each blob's extent *perpendicular* to
+that line rather than its raw diameter or area. This self-calibrates on every shot (the camera-to-ball
+distance stops mattering) and stays accurate even when motion smear stretches each ball image along
+its direction of travel, since smear doesn't affect the perpendicular extent.
+
+Segmentation uses an adaptive, descending sequence of thresholds rather than one fixed cutoff, so a
+ball dimmed by IR falloff (farther from the strobe) can still be found even when a brighter, closer
+ball in the same frame would saturate a threshold tuned for the dim one.
