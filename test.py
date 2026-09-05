@@ -405,6 +405,44 @@ def check_distractors_combined():
     return passed
 
 
+def check_online_distractor_rejected():
+    """The specific gap RANSAC's spacing check exists to close: a
+    distractor sitting *on* the flight line (not off to the side) at an
+    arbitrary offset -- e.g. a real laser dot marking the address
+    position, which sits on the line rather than beside it like the
+    generated one does. Collinearity alone can't reject this; only
+    checking that its position breaks the regular flash-interval spacing
+    can. Ball-sized on purpose, so the size filter can't be what saves it
+    either -- this isolates the spacing check specifically."""
+    speed_mph, angle_deg, num_flashes = 150.0, 12.0, 4
+    radius_px = generate.BALL_DIAMETER_PX / 2.0
+    start_pos = (400.0, 900.0)  # clear of the left edge, room for a distractor behind it
+    image, truth = generate_frame(
+        speed_mph, angle_deg, num_flashes=num_flashes, start_pos_px=start_pos,
+    )
+
+    angle_rad = math.radians(angle_deg)
+    direction = (math.cos(angle_rad), -math.sin(angle_rad))
+    # 180px behind ball1, on the extended flight line -- collinear, and
+    # its ratio to the real ~333px spacing (about 1.85x) is deliberately
+    # close to 2x to stress-test the spacing check against the missing-
+    # flash allowance it has to coexist with.
+    distractor_pos = (start_pos[0] - 180 * direction[0], start_pos[1] - 180 * direction[1])
+    generate._draw_ball(image, distractor_pos[0], distractor_pos[1], radius_px, value=255)
+
+    result = measure(image, truth["strobe_interval_ms"])
+    assert result is not None, "detector failed on a shot with an on-line ball-sized distractor"
+
+    speed_err_pct = abs(result["ball_speed_mph"] - speed_mph) / speed_mph * 100.0
+    print(f"on-line distractor (ball-sized, non-flash-timed offset): "
+          f"{result['num_ball_images']} blobs used, excluded_outlier={result['excluded_outlier_blobs']}, "
+          f"speed error {speed_err_pct:.4f}%")
+
+    passed = result["excluded_outlier_blobs"] >= 1 and speed_err_pct <= SPEED_ERROR_THRESHOLD_PCT
+    print("PASS" if passed else "FAIL")
+    return passed
+
+
 def check_missing_flash():
     """A missing/misfired exposure leaves one gap at ~2x width. Using mean
     spacing (before the fix) reads speed high; the fix should recover the
@@ -487,6 +525,8 @@ def main():
     print()
     distractors_combined_ok = check_distractors_combined()
     print()
+    online_distractor_ok = check_online_distractor_rejected()
+    print()
     missing_flash_ok = check_missing_flash()
     print()
     low_confidence_ok = check_missing_flash_low_confidence_with_3_balls()
@@ -496,8 +536,8 @@ def main():
     no_ball_ok = check_no_ball_frame()
 
     if not (sweep_ok and clip_ok and noise_ok and smear_ok and falloff_ok and combined_ok
-            and distractors_ok and distractors_combined_ok and missing_flash_ok
-            and low_confidence_ok and overlap_ok and no_ball_ok):
+            and distractors_ok and distractors_combined_ok and online_distractor_ok
+            and missing_flash_ok and low_confidence_ok and overlap_ok and no_ball_ok):
         sys.exit(1)
 
 

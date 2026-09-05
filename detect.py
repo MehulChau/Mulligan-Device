@@ -198,24 +198,71 @@ def _filter_by_size_consistency(blobs, band=SIZE_CONSISTENCY_BAND):
     return kept_blobs, len(blobs) - len(kept_blobs)
 
 
+SPACING_RANSAC_TOLERANCE = 0.08  # relative-to-base-gap tolerance for the RANSAC spacing check
+
+
+def _spacing_regularity(sorted_projections, tolerance=SPACING_RANSAC_TOLERANCE):
+    """Check that spacings between sorted, already-collinear points are all
+    consistent with integer multiples of one common base gap.
+
+    The minimum observed gap is taken as the candidate base -- a genuine
+    single-flash interval, since a gap spanning a missed exposure can only
+    be a multiple of it, never smaller (same reasoning `measure()` uses
+    for the missing-flash correction). A gap close to 1x, 2x, 3x, ... the
+    base passes; a gap that isn't close to *any* integer multiple (e.g. a
+    distractor sitting at an arbitrary point along the line, not at a
+    flash-timed position) fails.
+
+    Returns (is_consistent, rms_relative_error).
+    """
+    gaps = np.diff(sorted_projections)
+    if len(gaps) == 0:
+        return True, 0.0
+    base = np.min(gaps)
+    if base <= 0:
+        return False, float("inf")
+    multiples = np.maximum(np.round(gaps / base), 1.0)
+    relative_error = np.abs(gaps - multiples * base) / base
+    is_consistent = bool(np.all(relative_error <= tolerance))
+    rms_error = float(np.sqrt(np.mean(relative_error ** 2)))
+    return is_consistent, rms_error
+
+
 def _fit_line_ransac(pts, inlier_threshold_px=RANSAC_INLIER_THRESHOLD_PX):
-    """Find the largest set of mutually-collinear points among `pts` by
-    exhaustively trying every pair as a line hypothesis and scoring it by
-    how many points fall within `inlier_threshold_px` of it.
+    """Find the largest set of mutually-collinear, evenly-spaced points
+    among `pts` by exhaustively trying every pair as a line hypothesis.
 
-    Real ball images are both collinear and evenly spaced -- two strong
-    constraints a stray blob (a distractor that slipped past the size
-    filter, say) almost never satisfies by accident. Detected blob counts
-    here are small (a handful, rarely more than a dozen), so exhaustively
-    trying every pair is cheap and more reliable than random sampling --
-    it's not really "RANSAC" so much as its small-n limit, but the idea
-    (hypothesize from a minimal sample, score by consensus) is the same.
+    Collinearity alone isn't enough: a distractor that sits *on* the real
+    flight line (a laser dot marking the address position, say, which on
+    real hardware sits on the line rather than off to the side) would pass
+    a perpendicular-distance-only test. Real ball images are also evenly
+    spaced -- a second constraint a stray point at an arbitrary position
+    along the line almost never satisfies. For each line hypothesis:
+    collect the perpendicular-distance inliers, then greedily drop the
+    point whose removal most improves spacing consistency until what's
+    left passes (or falls below MIN_BALL_IMAGES) -- this recovers a
+    spacing-consistent subset even when the offending point is genuinely
+    collinear enough that perpendicular distance alone can't separate it
+    out. Missing/misfired flashes still pass, since the spacing check
+    accepts integer multiples of the base gap.
 
-    Returns a boolean inlier mask for the best line found.
+    Among all hypotheses that yield a spacing-consistent set, prefer more
+    inliers first, then lower combined (perpendicular + spacing) RMS --
+    an explicit tie-break, not iteration order.
+
+    Detected blob counts here are small (a handful, rarely more than a
+    dozen), so exhaustively trying every pair -- and, within each,
+    trimming one point at a time -- is cheap and more reliable than
+    random sampling; it's less "RANSAC" than its small-n limit, but the
+    idea (hypothesize from a minimal sample, score by consensus) is the
+    same.
+
+    Returns a boolean inlier mask for the best set found.
     """
     n = len(pts)
-    best_inliers = np.zeros(n, dtype=bool)
-    best_count = -1
+    best_mask = np.zeros(n, dtype=bool)
+    best_score = (-1, float("inf"))  # (inlier count, combined RMS) -- maximize count, then minimize RMS
+
     for i in range(n):
         for j in range(i + 1, n):
             d = pts[j] - pts[i]
@@ -223,14 +270,47 @@ def _fit_line_ransac(pts, inlier_threshold_px=RANSAC_INLIER_THRESHOLD_PX):
             if norm < 1e-9:
                 continue  # coincident points can't define a direction
             d = d / norm
-            perp_candidate = np.array([-d[1], d[0]])
-            dist = np.abs((pts - pts[i]) @ perp_candidate)
-            inliers = dist <= inlier_threshold_px
-            count = int(inliers.sum())
-            if count > best_count:
-                best_count = count
-                best_inliers = inliers
-    return best_inliers
+            perp = np.array([-d[1], d[0]])
+            rel = pts - pts[i]
+            perp_dist = np.abs(rel @ perp)
+            proj = rel @ d
+
+            candidate_idx = np.where(perp_dist <= inlier_threshold_px)[0]
+            if len(candidate_idx) < MIN_BALL_IMAGES:
+                continue
+
+            order = np.argsort(proj[candidate_idx])
+            cur_idx = candidate_idx[order]
+            cur_proj = proj[cur_idx]
+
+            # Greedily trim the point whose removal most improves spacing
+            # consistency, until the remaining set passes or runs out.
+            while len(cur_idx) >= MIN_BALL_IMAGES:
+                consistent, spacing_rms = _spacing_regularity(cur_proj)
+                if consistent:
+                    perp_rms = float(np.sqrt(np.mean(perp_dist[cur_idx] ** 2)))
+                    # Both terms normalized to a comparable, roughly-[0,1]
+                    # scale before combining: perp_rms against the inlier
+                    # threshold that defined it, spacing_rms is already a
+                    # relative (dimensionless) error.
+                    combined_rms = perp_rms / inlier_threshold_px + spacing_rms
+                    score = (len(cur_idx), -combined_rms)
+                    if score > best_score:
+                        best_score = score
+                        best_mask = np.zeros(n, dtype=bool)
+                        best_mask[cur_idx] = True
+                    break
+
+                worst_k, worst_rms = None, float("inf")
+                for k in range(len(cur_proj)):
+                    _, trial_rms = _spacing_regularity(np.delete(cur_proj, k))
+                    if trial_rms < worst_rms:
+                        worst_rms = trial_rms
+                        worst_k = k
+                cur_idx = np.delete(cur_idx, worst_k)
+                cur_proj = np.delete(cur_proj, worst_k)
+
+    return best_mask
 
 
 def _find_blobs(image, thresholds=(40,)):
