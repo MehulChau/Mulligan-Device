@@ -50,11 +50,16 @@ strobe), `laser_dot` / `mat_reflection` / `clubhead_edge` (distractors a real ra
 and `missing_flash_index` (a strobe pulse that didn't fire) to exercise the detector against harder,
 more realistic frames.
 
-Known gap: `laser_dot` and an isolated round `mat_reflection` currently survive the area/circularity
-filters that are meant to reject non-ball blobs -- neither filter checks a candidate's size against the
-expected ball diameter, so a small, bright, round distractor reads as a valid ball image and can badly
-corrupt a measurement. `test.py`'s `check_distractors` reports this as a known limitation rather than
-asserting it away.
+`laser_dot` and an isolated round `mat_reflection` both survive detect.py's basic per-blob filters
+(area, circularity, border) -- neither checks a candidate's size against the expected ball diameter.
+What actually rejects them is two frame-level checks in `measure()`: a relative size-consistency filter
+(all genuine ball images in one frame are the same physical object, so they cluster tightly in size
+regardless of what that size actually is) and a RANSAC-style line fit that keeps only the largest
+mutually collinear, evenly-spaced consensus set. The two are complementary -- a reflection that happens
+to be ball-sized still gets caught by the line fit for not being on the flight line, and something
+small enough to be size-filtered never reaches the line fit at all. `test.py`'s `check_distractors`
+shows the basic filters alone letting these through; `check_distractors_combined` shows the full
+pipeline (all three distractors, plus noise and falloff, at once) handling them.
 
 ## How the scale is derived
 
@@ -70,4 +75,11 @@ its direction of travel, since smear doesn't affect the perpendicular extent.
 
 Segmentation uses an adaptive, descending sequence of thresholds rather than one fixed cutoff, so a
 ball dimmed by IR falloff (farther from the strobe) can still be found even when a brighter, closer
-ball in the same frame would saturate a threshold tuned for the dim one.
+ball in the same frame would saturate a threshold tuned for the dim one. The threshold sequence is
+derived from the frame's own background/noise statistics (median and MAD), not blind halving, so it
+can't itself dip below the ambient background and threshold the whole frame to white.
+
+`measure()`'s result includes `excluded_border_blobs`, `excluded_size_blobs`, `excluded_outlier_blobs`,
+and `consensus_size` -- together they say *where* blobs were lost (edge clipping, size inconsistency,
+or failing the line-fit consensus), which on real hardware is what distinguishes a bad reading caused
+by detection from one caused by measurement.

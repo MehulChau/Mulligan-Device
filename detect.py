@@ -1,9 +1,12 @@
 """Measure ball speed and launch angle from a strobe photograph.
 
 Pipeline: threshold -> find round blobs -> subpixel centroid of each ->
-fit a line through the centres -> derive mm/px from each blob's extent
-*perpendicular* to that line (immune to motion smear along it) -> speed
-from mean spacing, angle from the line's slope.
+reject blobs whose size is inconsistent with the rest (relative to the
+modal detected size, not a fixed expected diameter) -> robustly fit a
+line through the surviving centres, keeping only the largest mutually-
+collinear/evenly-spaced consensus set -> derive mm/px from each consensus
+blob's extent *perpendicular* to that line (immune to motion smear along
+it) -> speed from spacing, angle from the line's slope.
 """
 
 import math
@@ -20,6 +23,21 @@ MIN_BALL_IMAGES = 3
 # exposure, not just measurement noise: a clean flash sequence's spacing
 # consistency is normally well under 0.05 even with realistic noise.
 UNEVEN_SPACING_THRESHOLD = 0.15
+
+# A blob's size must fall within this band of the *modal* detected size to
+# survive -- relative, not absolute, since the modal size is whatever the
+# real ball happens to measure at this camera's actual (unknown) distance.
+# A hardcoded expected diameter would quietly reintroduce the fixed-
+# distance assumption the perpendicular-extent scale derivation exists to
+# remove. The band is wide (0.6x-1.6x) because it only needs to separate
+# one real, consistent physical object from something else entirely (a
+# laser dot at ~8px next to balls at ~99px is off by 12x), not to pin down
+# an exact size.
+SIZE_CONSISTENCY_BAND = (0.6, 1.6)
+
+# Perpendicular distance (px) from a candidate line within which a blob
+# counts as an inlier during the RANSAC line fit.
+RANSAC_INLIER_THRESHOLD_PX = 5.0
 
 
 def _measure_blob(image, contour, img_w, img_h):
@@ -147,6 +165,74 @@ def _adaptive_thresholds(image, min_threshold):
     return sorted(thresholds, reverse=True)
 
 
+def _isotropic_diameter(blob):
+    """A direction-agnostic size estimate for a blob, used only to compare
+    blobs' sizes to each other (not to derive scale -- that still happens
+    via the perpendicular-projected variance once a flight line is known).
+    For a uniform disk, the average of the two axis variances equals the
+    same R^2/4 as either axis alone; for a smeared blob it's inflated by
+    roughly the same amount regardless of orientation, so real ball images
+    under the same smear stay mutually consistent by this measure even
+    though it isn't the precise perpendicular value used for scale."""
+    mxx, myy, _ = blob["cov"]
+    return 4.0 * math.sqrt(max((mxx + myy) / 2.0, 0.0))
+
+
+def _filter_by_size_consistency(blobs, band=SIZE_CONSISTENCY_BAND):
+    """Reject blobs whose size is far from the modal detected size.
+
+    All genuine ball images in one frame are the same physical object --
+    IR falloff changes their brightness, not their diameter -- so they
+    cluster tightly in size regardless of what that size actually is at
+    this camera's (unknown) distance. The median of the detected sizes is
+    a stand-in for the mode; establishing it needs at least MIN_BALL_IMAGES
+    blobs, which the caller already guarantees before calling this.
+    """
+    if len(blobs) < MIN_BALL_IMAGES:
+        return blobs, 0
+    sizes = np.array([_isotropic_diameter(b) for b in blobs])
+    modal_size = float(np.median(sizes))
+    lo, hi = band[0] * modal_size, band[1] * modal_size
+    keep = (sizes >= lo) & (sizes <= hi)
+    kept_blobs = [b for b, k in zip(blobs, keep) if k]
+    return kept_blobs, len(blobs) - len(kept_blobs)
+
+
+def _fit_line_ransac(pts, inlier_threshold_px=RANSAC_INLIER_THRESHOLD_PX):
+    """Find the largest set of mutually-collinear points among `pts` by
+    exhaustively trying every pair as a line hypothesis and scoring it by
+    how many points fall within `inlier_threshold_px` of it.
+
+    Real ball images are both collinear and evenly spaced -- two strong
+    constraints a stray blob (a distractor that slipped past the size
+    filter, say) almost never satisfies by accident. Detected blob counts
+    here are small (a handful, rarely more than a dozen), so exhaustively
+    trying every pair is cheap and more reliable than random sampling --
+    it's not really "RANSAC" so much as its small-n limit, but the idea
+    (hypothesize from a minimal sample, score by consensus) is the same.
+
+    Returns a boolean inlier mask for the best line found.
+    """
+    n = len(pts)
+    best_inliers = np.zeros(n, dtype=bool)
+    best_count = -1
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = pts[j] - pts[i]
+            norm = math.hypot(d[0], d[1])
+            if norm < 1e-9:
+                continue  # coincident points can't define a direction
+            d = d / norm
+            perp_candidate = np.array([-d[1], d[0]])
+            dist = np.abs((pts - pts[i]) @ perp_candidate)
+            inliers = dist <= inlier_threshold_px
+            count = int(inliers.sum())
+            if count > best_count:
+                best_count = count
+                best_inliers = inliers
+    return best_inliers
+
+
 def _find_blobs(image, thresholds=(40,)):
     """Find round, ball-sized blobs, trying each threshold in `thresholds`
     (highest first) and only adding blobs not already found at a higher
@@ -208,13 +294,21 @@ def _find_blobs(image, thresholds=(40,)):
 def measure(image, strobe_interval_ms, threshold=40, adaptive=False):
     """Return dict with ball_speed_mph, launch_angle_deg, ball_centers,
     scale_mm_per_px, and fit-quality confidence signals. Returns None if
-    fewer than MIN_BALL_IMAGES ball images are found.
+    fewer than MIN_BALL_IMAGES ball images survive detection, size
+    filtering, or the line-fit consensus requirement.
 
     threshold: segmentation threshold (0-255) used to find candidate blobs.
     adaptive: if True, try a descending sequence of thresholds derived from
         the frame's own background/noise statistics instead of just one,
         to catch faint (e.g. far-from-strobe) balls a single global
         threshold would miss.
+
+    The result's excluded_border_blobs, excluded_size_blobs,
+    excluded_outlier_blobs, and consensus_size together say *where* blobs
+    were lost -- border clipping, size inconsistency (e.g. a distractor),
+    or failing the line-fit consensus -- which on real hardware is what
+    distinguishes a bad reading caused by detection from one caused by
+    measurement.
     """
 
     if image.ndim == 3:
@@ -225,13 +319,45 @@ def measure(image, strobe_interval_ms, threshold=40, adaptive=False):
     if len(blobs) < MIN_BALL_IMAGES:
         return None
 
-    centers = sorted((b["center"] for b in blobs), key=lambda c: c[0])
-    pts = np.array(centers)
+    # Relative size filter: reject blobs far from the modal detected size
+    # before they ever reach the line fit. A laser dot or other small
+    # bright distractor is wrong by a large factor (often 10x+) regardless
+    # of what the real ball's size turns out to be at this camera's
+    # (unknown) distance -- deliberately not compared to any fixed
+    # expected diameter, since that would reintroduce the fixed-distance
+    # assumption the perpendicular-extent scale derivation removes.
+    blobs, excluded_size = _filter_by_size_consistency(blobs)
+    if len(blobs) < MIN_BALL_IMAGES:
+        return None
 
-    # Least-squares line fit through the centres. Centroids are unbiased
-    # under symmetric motion smear (smear stretches a blob but doesn't
-    # shift its centre of mass), so fitting the line first, before scale,
-    # is safe even when smear is present.
+    pts = np.array([b["center"] for b in blobs])
+
+    # Robust line fit: real ball images are both collinear and evenly
+    # spaced, two constraints a stray blob (one that happened to survive
+    # size filtering) almost never satisfies at once. Fitting through
+    # every detected blob would let a single survivor corrupt the
+    # direction, the perpendicular scale, and the spacing all at once, so
+    # find the largest mutually-collinear subset first and fit only on
+    # that -- refitting via SVD for the final, precise line.
+    inlier_mask = _fit_line_ransac(pts)
+    num_candidates = len(blobs)
+    num_inliers = int(inlier_mask.sum())
+    excluded_outliers = num_candidates - num_inliers
+
+    # An absolute floor and a majority requirement: a consensus set below
+    # MIN_BALL_IMAGES can't define a trustworthy line at all, and a
+    # "consensus" that isn't even a majority of what was detected means
+    # the outliers outnumber the real balls -- not a shot to guess at.
+    if num_inliers < MIN_BALL_IMAGES or 2 * num_inliers <= num_candidates:
+        return None
+
+    blobs = [b for b, keep in zip(blobs, inlier_mask) if keep]
+    pts = pts[inlier_mask]
+
+    # Least-squares line fit through the consensus centres. Centroids are
+    # unbiased under symmetric motion smear (smear stretches a blob but
+    # doesn't shift its centre of mass), so fitting the line first, before
+    # scale, is safe even when smear is present.
     mean = pts.mean(axis=0)
     centered = pts - mean
     # Principal direction via SVD is well-defined even for near-vertical lines.
@@ -287,7 +413,15 @@ def measure(image, strobe_interval_ms, threshold=40, adaptive=False):
     # spanning a missed exposure can only be a multiple of it, never
     # smaller, so the smallest observed gap is never itself corrupted by
     # a skip (as long as at least one true single-interval gap survived).
-    missing_flash_detected = spacing_consistency > UNEVEN_SPACING_THRESHOLD
+    #
+    # With only 3 balls (2 gaps), though, spacing_consistency is computed
+    # from a single pair of gaps -- a noisy statistic on its own -- and
+    # the minimum of just 2 values is itself biased low. Below 4 balls
+    # (3+ gaps), don't apply the correction; flag the frame as
+    # low-confidence instead so the caller knows not to trust it blindly.
+    uneven_spacing = spacing_consistency > UNEVEN_SPACING_THRESHOLD
+    missing_flash_detected = uneven_spacing and len(blobs) >= 4
+    low_confidence_spacing = uneven_spacing and len(blobs) < 4
     representative_spacing_px = float(np.min(spacings_px)) if missing_flash_detected else mean_spacing_px
 
     speed_mm_per_flash = representative_spacing_px * scale_mm_per_px
@@ -306,9 +440,13 @@ def measure(image, strobe_interval_ms, threshold=40, adaptive=False):
         "mean_diameter_px": mean_diameter_px,
         "num_ball_images": len(blobs),
         "excluded_border_blobs": excluded_border,
+        "excluded_size_blobs": excluded_size,
+        "excluded_outlier_blobs": excluded_outliers,
+        "consensus_size": num_inliers,
         "line_fit_rms_px": line_fit_rms_px,
         "spacing_consistency": spacing_consistency,
         "missing_flash_detected": missing_flash_detected,
+        "low_confidence_spacing": low_confidence_spacing,
     }
 
 
@@ -324,10 +462,17 @@ if __name__ == "__main__":
 
     result = measure(img, interval_ms)
     if result is None:
-        raise SystemExit("fewer than 3 ball images detected; cannot measure")
+        raise SystemExit("fewer than 3 ball images survived detection/filtering; cannot measure")
 
     print(f"speed:  {result['ball_speed_mph']:.1f} mph")
     print(f"angle:  {result['launch_angle_deg']:.2f} deg")
-    print(f"blobs:  {result['num_ball_images']} (excluded {result['excluded_border_blobs']} touching the frame border)")
+    print(f"blobs:  {result['num_ball_images']} used "
+          f"(excluded: {result['excluded_border_blobs']} border, "
+          f"{result['excluded_size_blobs']} size, {result['excluded_outlier_blobs']} outlier; "
+          f"consensus {result['consensus_size']})")
     print(f"scale:  {result['scale_mm_per_px']:.4f} mm/px")
     print(f"fit rms: {result['line_fit_rms_px']:.3f} px, spacing cv: {result['spacing_consistency']:.4f}")
+    if result["missing_flash_detected"]:
+        print("note: uneven spacing detected, corrected via minimum-spacing (likely a missed flash)")
+    if result["low_confidence_spacing"]:
+        print("note: uneven spacing detected but only 3 balls -- low confidence, not corrected")

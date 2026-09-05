@@ -292,8 +292,14 @@ def _contour_survives_filters(image):
 
 def check_distractors():
     """Report (not gate, except where a real defense exists) how each
-    distractor fares against the area/circularity/border filters."""
-    print("distractor survival:")
+    distractor fares against detect.py's *basic* per-blob filters --
+    area, circularity, and border-touching -- in isolation. The laser dot
+    and an isolated round reflection are known to survive these alone;
+    what actually rejects them is the size-consistency filter and the
+    RANSAC line fit in measure(), exercised end-to-end (with all three
+    distractors, plus noise and falloff, at once) by
+    check_distractors_combined below."""
+    print("distractor survival (basic per-blob filters only):")
     passed = True
 
     # Laser dot: round and bright like a real ball, just much smaller.
@@ -307,8 +313,11 @@ def check_distractors():
               f"{'SURVIVES filters (false positive)' if status else 'rejected'}"
               + (f"  [area_ok={info['area_ok']} circ={info['circ']:.2f}]" if info else " [no separate contour]"))
 
-    # Confirm the practical consequence of a surviving laser dot: it gets
-    # treated as a genuine 5th ball and corrupts the whole measurement.
+    # An 8px laser dot survives the basic filters above, but full measure()
+    # also applies the size-consistency filter and RANSAC line fit -- this
+    # confirms *those* are what actually keep the measurement clean, not
+    # area/circularity (which is exactly why check_distractors_combined
+    # gates on the full pipeline instead of this basic-filter view).
     speed_mph, angle_deg, num_flashes = 150.0, 12.0, 4
     clean_image, clean_truth = generate_frame(speed_mph, angle_deg, num_flashes=num_flashes)
     clean_result = measure(clean_image, clean_truth["strobe_interval_ms"])
@@ -318,10 +327,11 @@ def check_distractors():
     laser_result = measure(laser_image, laser_truth["strobe_interval_ms"])
     if laser_result is not None:
         err = abs(laser_result["ball_speed_mph"] - speed_mph) / speed_mph * 100.0
-        print(f"  impact: undetected 8px laser dot -> {laser_result['num_ball_images']} blobs "
-              f"(vs {clean_result['num_ball_images']} clean), speed error {err:.1f}% "
-              f"(known gap: area/circularity alone don't defend against a small round bright "
-              f"distractor -- neither filter checks blob size against the expected ball diameter)")
+        print(f"  full pipeline with an 8px laser dot present: {laser_result['num_ball_images']} blobs used "
+              f"(vs {clean_result['num_ball_images']} clean), excluded_size={laser_result['excluded_size_blobs']}, "
+              f"speed error {err:.3f}% "
+              f"(area/circularity alone would have let this through -- size-consistency filtering "
+              f"and the RANSAC line fit in measure() are the actual defense)")
 
     # Mat reflection: diffuse, but the default is *elongated* -- that's what
     # circularity actually catches here, not the soft edge. An isolated,
@@ -353,6 +363,48 @@ def check_distractors():
     return passed
 
 
+def check_distractors_combined():
+    """Gating: laser dot, mat reflection, and clubhead edge all present at
+    once, plus noise and IR falloff -- the realistic worst case. The
+    size-consistency filter (item 1) and RANSAC line fit (item 2) are what
+    should make this survivable now, where basic per-blob filtering alone
+    could not (see check_distractors)."""
+    np.random.seed(20240605)
+    speed_mph, angle_deg, num_flashes = 150.0, 12.0, 4
+    noise_sigma = 3.0
+
+    # The reflection's default position is close enough to a real ball
+    # that, once IR falloff forces a very low adaptive threshold to see
+    # the dim far balls, it merges into that ball's contour instead of
+    # staying a separate (and separately rejectable) blob -- so it's
+    # placed further from the flight line here, same as the isolated
+    # roundness check above.
+    image, truth = generate_frame(
+        speed_mph, angle_deg, num_flashes=num_flashes,
+        ir_falloff=True, laser_dot=True, laser_dot_radius_px=8.0,
+        mat_reflection=True, mat_reflection_pos_px=(700.0, 300.0),
+        clubhead_edge=True,
+    )
+    noisy = _apply_background_and_noise(image, BACKGROUND_LEVEL, noise_sigma)
+    result = measure(noisy, truth["strobe_interval_ms"], threshold=40, adaptive=True)
+
+    if result is None:
+        print("distractors + noise + falloff combined: detection FAILED")
+        print("FAIL")
+        return False
+
+    speed_err_pct = abs(result["ball_speed_mph"] - speed_mph) / speed_mph * 100.0
+    print(f"distractors + noise + falloff combined: {result['num_ball_images']} blobs used, "
+          f"consensus {result['consensus_size']} "
+          f"(excluded: border={result['excluded_border_blobs']}, "
+          f"size={result['excluded_size_blobs']}, outlier={result['excluded_outlier_blobs']}), "
+          f"speed error {speed_err_pct:.3f}%")
+
+    passed = speed_err_pct <= SPEED_ERROR_THRESHOLD_PCT
+    print("PASS" if passed else "FAIL")
+    return passed
+
+
 def check_missing_flash():
     """A missing/misfired exposure leaves one gap at ~2x width. Using mean
     spacing (before the fix) reads speed high; the fix should recover the
@@ -368,6 +420,25 @@ def check_missing_flash():
           f"missing_flash_detected={result['missing_flash_detected']}")
 
     passed = result["missing_flash_detected"] and speed_err_pct <= SPEED_ERROR_THRESHOLD_PCT
+    print("PASS" if passed else "FAIL")
+    return passed
+
+
+def check_missing_flash_low_confidence_with_3_balls():
+    """With only 3 balls (2 gaps), spacing_consistency is a noisy
+    statistic and the minimum-of-2 is itself biased low -- the min-spacing
+    correction must not fire here. The frame should be flagged
+    low-confidence instead of "corrected" with a still-wrong number."""
+    speed_mph, angle_deg, num_flashes = 150.0, 12.0, 4
+    image, truth = generate_frame(speed_mph, angle_deg, num_flashes=num_flashes, missing_flash_index=1)
+    result = measure(image, truth["strobe_interval_ms"])
+    assert result is not None, "detector failed on a 3-ball shot with one missing flash"
+
+    print(f"missing flash, 3 balls remaining: speed={result['ball_speed_mph']:.1f} mph "
+          f"(true {speed_mph}), missing_flash_detected={result['missing_flash_detected']}, "
+          f"low_confidence_spacing={result['low_confidence_spacing']}")
+
+    passed = result["low_confidence_spacing"] and not result["missing_flash_detected"]
     print("PASS" if passed else "FAIL")
     return passed
 
@@ -414,14 +485,19 @@ def main():
     print()
     distractors_ok = check_distractors()
     print()
+    distractors_combined_ok = check_distractors_combined()
+    print()
     missing_flash_ok = check_missing_flash()
+    print()
+    low_confidence_ok = check_missing_flash_low_confidence_with_3_balls()
     print()
     overlap_ok = check_overlapping_balls_fail_safely()
     print()
     no_ball_ok = check_no_ball_frame()
 
     if not (sweep_ok and clip_ok and noise_ok and smear_ok and falloff_ok and combined_ok
-            and distractors_ok and missing_flash_ok and overlap_ok and no_ball_ok):
+            and distractors_ok and distractors_combined_ok and missing_flash_ok
+            and low_confidence_ok and overlap_ok and no_ball_ok):
         sys.exit(1)
 
 
