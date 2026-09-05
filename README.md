@@ -1,8 +1,9 @@
 # Mulligan Device
 
 A DIY golf launch monitor. This repo measures ball speed and vertical launch angle from a single
-strobe photograph. It does not simulate ball flight, does not know about golf clubs, and does not
-compute carry distance — a separate app owns that.
+strobe photograph, and reports them to the companion app over the device protocol
+(`docs/device-protocol.md`). It does not simulate ball flight, does not know about golf clubs, and
+does not compute carry distance — a separate app owns that.
 
 ## The strobe concept
 
@@ -28,16 +29,22 @@ enough to true over two feet of flight that gravity and drag don't matter yet.
   from it.
 - `test.py` — generates frames across a realistic speed/angle range, runs the detector against each,
   and compares measured values against the ground truth.
+- `server.py` — the device side of `docs/device-protocol.md`: a WebSocket server the app connects to,
+  emitting a `shot` (measured by the real generate.py/detect.py pipeline against a synthetic frame) on
+  a keypress.
+- `docs/device-protocol.md` — the app/device contract. Canonical copy lives in the app repo; this is a
+  mirror kept for local reference. See the file's own header before editing it.
 
-Everything runs on a laptop against generated images. No camera capture, no GPIO, no strobe hardware
-control, no networking, no ball flight simulation — those come later.
+Everything runs on a laptop. No camera capture, no GPIO, no strobe hardware control, no ball flight
+simulation — those come later. The device protocol server is real, but its shots are synthetic until
+the camera exists.
 
 ## Running it
 
 ```
 python3 -m venv .venv
 source .venv/bin/activate
-pip install opencv-python numpy
+pip install -r requirements.txt   # opencv-python, numpy, websockets
 
 python generate.py   # writes frame.png / frame.json for a single example shot
 python detect.py frame.png 2.2   # measure a single frame (image path, strobe interval in ms)
@@ -83,3 +90,30 @@ can't itself dip below the ambient background and threshold the whole frame to w
 and `consensus_size` -- together they say *where* blobs were lost (edge clipping, size inconsistency,
 or failing the line-fit consensus), which on real hardware is what distinguishes a bad reading caused
 by detection from one caused by measurement.
+
+The line fit itself checks two things, not one: candidate ball images must be both collinear *and*
+evenly spaced (gaps consistent with integer multiples of one common flash interval, so a genuine missed
+flash still passes). Collinearity alone isn't enough -- a distractor that happens to sit on the flight
+line (a laser dot marking the address position, say) would pass a collinearity-only test trivially;
+it's the spacing check that catches it, since its position along the line rarely lines up with the
+flash timing.
+
+## Running the device server
+
+```
+python server.py --serve                    # listens on ws://0.0.0.0:8080 by default
+python server.py --serve --port 9000        # non-default port
+python server.py --serve --device-id my-pi  # stable id the app sees across reboots
+```
+
+The server prints its `bootId` on startup and waits for an app to connect. Once connected, press Enter
+(or `s`) in the server's terminal to emit one `shot` -- generated and measured by the real
+generate.py/detect.py pipeline against a fresh synthetic frame, not fabricated -- to every connected
+app. Press `q` to shut down.
+
+**The loop, end to end:** start `python server.py --serve` on this machine, point the app's Device
+source at `ws://<this machine's address>:8080` (`ws://localhost:8080` if the app runs on the same
+machine) and connect, then press a key in the server's terminal and watch a ball fly on the app's hole.
+Killing the server should show a clear disconnected state in the app without ending its round;
+restarting it should let the app reconnect (same `bootId` if the process wasn't restarted, a new one if
+it was -- see `docs/device-protocol.md`'s notes on `bootId`/`seq` dedup).
