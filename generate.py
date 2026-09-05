@@ -29,9 +29,21 @@ SCALE_MM_PER_PX = (FOV_WIDTH_M * 1000.0) / SENSOR_WIDTH_PX
 BALL_DIAMETER_MM = 42.67
 BALL_DIAMETER_PX = BALL_DIAMETER_MM / SCALE_MM_PER_PX
 
-DEFAULT_STROBE_INTERVAL_MS = 2.9
+# The fastest expected shot (a driver, ~150 mph) must fit its requested
+# number of exposures inside the sensor width -- that's what sets this
+# interval, not the other way around. With a half-ball-diameter start
+# margin (the first ball tangent to the left edge), 2.2 ms fits 5 flashes
+# of a 150 mph/12deg driver fully in frame; 2.9 ms only fits 4.
+DEFAULT_STROBE_INTERVAL_MS = 2.2
 
 MPH_TO_MPS = 0.44704
+
+# A ball placed exactly tangent to the frame edge is indistinguishable, from
+# the image alone, from one that's genuinely clipped -- both produce a blob
+# bounding box flush against the border. A few pixels of buffer beyond the
+# bare half-diameter minimum avoids that ambiguity without materially
+# changing how many flashes fit (the driver case below has ~20px of slack).
+BORDER_SAFETY_PX = 3.0
 
 
 def _draw_ball(image, cx, cy, radius, value=255):
@@ -64,6 +76,18 @@ def _draw_ball(image, cx, cy, radius, value=255):
     image[y0:y1, x0:x1] = np.maximum(image[y0:y1, x0:x1], patch)
 
 
+def _ball_visibility(cx, cy, radius, width, height):
+    """Classify a ball image against the frame bounds: fully_in_frame,
+    clipped (partially overlaps), or off_frame (no overlap, nothing drawn)."""
+    left, right = cx - radius, cx + radius
+    top, bottom = cy - radius, cy + radius
+    if right <= 0 or left >= width or bottom <= 0 or top >= height:
+        return "off_frame"
+    if left < 0 or right > width or top < 0 or bottom > height:
+        return "clipped"
+    return "fully_in_frame"
+
+
 def generate_frame(
     ball_speed_mph,
     launch_angle_deg,
@@ -88,27 +112,42 @@ def generate_frame(
     # Image y increases downward; the ball rises, so y decreases.
     dy_px = -step_px * math.sin(angle_rad)
 
+    radius_px = BALL_DIAMETER_PX / 2.0
+
     if start_pos_px is None:
-        # Start near the bottom-left, leaving room for the full flight path.
-        margin = BALL_DIAMETER_PX
-        start_x = margin * 1.5
-        start_y = height - margin * 1.5
+        # Half a ball diameter from the edge, plus a small border-safety
+        # buffer (see BORDER_SAFETY_PX above).
+        margin = radius_px + BORDER_SAFETY_PX
+        start_x = margin
+        start_y = height - margin
         start_pos_px = (start_x, start_y)
 
-    radius_px = BALL_DIAMETER_PX / 2.0
-    centers = []
+    balls = []
+    off_frame_count = 0
     for i in range(num_flashes):
         cx = start_pos_px[0] + i * dx_px
         cy = start_pos_px[1] + i * dy_px
-        centers.append((cx, cy))
+        status = _ball_visibility(cx, cy, radius_px, width, height)
+        balls.append({"center_px": (cx, cy), "status": status})
+        if status == "off_frame":
+            off_frame_count += 1
+            continue  # nothing to draw -- it isn't in the image at all
         _draw_ball(image, cx, cy, radius_px)
+
+    if off_frame_count:
+        raise ValueError(
+            f"{off_frame_count} of {num_flashes} requested flashes fall entirely "
+            "outside the frame at this speed/angle/interval -- the requested "
+            "scenario was not produced. Reduce num_flashes, shorten "
+            "strobe_interval_ms, or move start_pos_px."
+        )
 
     ground_truth = {
         "ball_speed_mph": ball_speed_mph,
         "launch_angle_deg": launch_angle_deg,
         "num_flashes": num_flashes,
         "strobe_interval_ms": strobe_interval_ms,
-        "ball_centers_px": centers,
+        "balls": balls,
         "ball_diameter_px": radius_px * 2.0,
         "scale_mm_per_px": SCALE_MM_PER_PX,
         "image_width": width,
@@ -124,7 +163,10 @@ def save_frame(image, ground_truth, image_path, json_path):
 
 
 if __name__ == "__main__":
-    img, gt = generate_frame(ball_speed_mph=150.0, launch_angle_deg=12.0, num_flashes=5)
+    # A 150 mph driver at 12deg fits 4 flashes fully in frame at the
+    # default 2.2 ms interval (5 fits exactly at the boundary -- 4 leaves
+    # headroom for a real, non-idealized shot).
+    img, gt = generate_frame(ball_speed_mph=150.0, launch_angle_deg=12.0, num_flashes=4)
     save_frame(img, gt, "frame.png", "frame.json")
     print(f"scale: {SCALE_MM_PER_PX:.4f} mm/px, ball diameter: {BALL_DIAMETER_PX:.1f} px")
     print("wrote frame.png and frame.json")

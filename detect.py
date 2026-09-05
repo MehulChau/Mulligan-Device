@@ -17,11 +17,21 @@ MIN_BALL_IMAGES = 3
 
 
 def _find_blobs(image, threshold=40):
-    """Threshold and return (center, radius_px, area) for round, ball-sized blobs."""
+    """Threshold and return (center, radius_px, area) for round, ball-sized
+    blobs, plus a count of blobs excluded for touching the frame border.
+
+    A ball clipped by the frame edge is the normal case for the last
+    exposure of a shot, not a rare edge case -- but its measured diameter
+    and centroid are both wrong (a 51%-visible ball reports a diameter far
+    below its true 98.6px), so it must be dropped entirely rather than fed
+    into the scale average or the line fit.
+    """
+    img_h, img_w = image.shape
     _, binary = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     blobs = []
+    excluded_border = 0
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < 20:
@@ -34,10 +44,22 @@ def _find_blobs(image, threshold=40):
             continue  # reject non-round blobs (streaks, reflections, edges)
 
         x, y, w, h = cv2.boundingRect(contour)
+        if x <= 0 or y <= 0 or x + w >= img_w or y + h >= img_h:
+            excluded_border += 1
+            continue  # clipped by the frame edge: diameter and centroid are both unreliable
+
         pad = 2
         x0, y0 = max(x - pad, 0), max(y - pad, 0)
-        x1, y1 = min(x + w + pad, image.shape[1]), min(y + h + pad, image.shape[0])
+        x1, y1 = min(x + w + pad, img_w), min(y + h + pad, img_h)
         roi = image[y0:y1, x0:x1].astype(np.float64)
+
+        # Estimate the local background from the ROI's border pixels and
+        # subtract it before computing area or centroid. A non-zero or
+        # noisy background would otherwise inflate the weighted area and
+        # pull the intensity-weighted centroid toward it.
+        border_pixels = np.concatenate([roi[0, :], roi[-1, :], roi[:, 0], roi[:, -1]])
+        background = np.median(border_pixels)
+        roi = np.clip(roi - background, 0.0, None)
 
         # Intensity-weighted centroid (image moments) for subpixel accuracy.
         ys, xs = np.mgrid[0:roi.shape[0], 0:roi.shape[1]]
@@ -47,18 +69,25 @@ def _find_blobs(image, threshold=40):
         cx = (xs * roi).sum() / total + x0
         cy = (ys * roi).sum() / total + y0
 
-        # Area from the raw (unthresholded) grayscale coverage, not the
-        # binary mask: an anti-aliased edge carries fractional pixel
-        # intensity right at the boundary, and a hard binary threshold
-        # would cut through that ramp at an essentially arbitrary point,
-        # biasing the recovered radius by a threshold-dependent amount.
-        # Summing raw intensity (0-255) and dividing by 255 recovers the
-        # true covered area regardless of the threshold used to segment.
-        weighted_area = roi.sum() / 255.0
+        # Area from the raw (unthresholded, background-subtracted) grayscale
+        # coverage, not the binary mask: an anti-aliased edge carries
+        # fractional pixel intensity right at the boundary, and a hard
+        # binary threshold would cut through that ramp at an essentially
+        # arbitrary point, biasing the recovered radius by a
+        # threshold-dependent amount. Normalize by the ROI's own observed
+        # peak (after background subtraction), not a hardcoded 255: the
+        # ball is IR-bright enough to saturate the sensor at the same peak
+        # whether or not an ambient background is present, so a fixed-255
+        # normalization would treat saturated interior pixels as less than
+        # fully covered and undercount area by roughly background/255.
+        peak = roi.max()
+        if peak <= 0:
+            continue
+        weighted_area = np.clip(roi / peak, 0.0, 1.0).sum()
         radius_px = math.sqrt(weighted_area / math.pi)
         blobs.append({"center": (cx, cy), "radius_px": radius_px, "area": area})
 
-    return blobs
+    return blobs, excluded_border
 
 
 def measure(image, strobe_interval_ms, threshold=40):
@@ -69,7 +98,7 @@ def measure(image, strobe_interval_ms, threshold=40):
     if image.ndim == 3:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    blobs = _find_blobs(image, threshold=threshold)
+    blobs, excluded_border = _find_blobs(image, threshold=threshold)
     if len(blobs) < MIN_BALL_IMAGES:
         return None
 
@@ -124,6 +153,7 @@ def measure(image, strobe_interval_ms, threshold=40):
         "scale_mm_per_px": scale_mm_per_px,
         "mean_diameter_px": mean_diameter_px,
         "num_ball_images": len(blobs),
+        "excluded_border_blobs": excluded_border,
         "line_fit_rms_px": line_fit_rms_px,
         "spacing_consistency": spacing_consistency,
     }
@@ -145,6 +175,6 @@ if __name__ == "__main__":
 
     print(f"speed:  {result['ball_speed_mph']:.1f} mph")
     print(f"angle:  {result['launch_angle_deg']:.2f} deg")
-    print(f"blobs:  {result['num_ball_images']}")
+    print(f"blobs:  {result['num_ball_images']} (excluded {result['excluded_border_blobs']} touching the frame border)")
     print(f"scale:  {result['scale_mm_per_px']:.4f} mm/px")
     print(f"fit rms: {result['line_fit_rms_px']:.3f} px, spacing cv: {result['spacing_consistency']:.4f}")
