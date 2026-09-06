@@ -5,6 +5,24 @@ strobe photograph, and reports them to the companion app over the device protoco
 (`docs/device-protocol.md`). It does not simulate ball flight, does not know about golf clubs, and
 does not compute carry distance — a separate app owns that.
 
+## Status
+
+**Real:** the detection pipeline (`detect.py`) and everything in it — thresholding, size-consistency
+filtering, the spacing-aware RANSAC line fit, the perpendicular-extent scale derivation, the missing-
+flash correction. The accuracy numbers in this README and in `test.py` are measured, not aspirational.
+The device protocol server (`server.py`) is a real, working WebSocket server speaking real protocol
+v1.1 — verified end-to-end against the actual app (tag `e2e`): `hello`/`bootId` accepted, a `shot`
+produced a ball flight with correct provenance.
+
+**Synthetic:** every frame `detect.py` has ever measured, including the one behind that end-to-end
+verification, was drawn by `generate.py`, not captured by a camera. There is no camera. There is no
+strobe. There is no GPIO. `server.py` calling `generate.generate_frame()` on a keypress is a stand-in
+for hardware that doesn't exist yet, not a simulation of one — the detection and protocol code
+downstream of that frame is the exact code that will run against a real photograph.
+
+Next work here is hardware bring-up, not software: build the camera/strobe rig, get one real frame,
+and see how much of the above still holds.
+
 ## The strobe concept
 
 A camera sits about 2 feet to the side of a golf ball. When the club swings through, the camera opens

@@ -198,7 +198,20 @@ def _filter_by_size_consistency(blobs, band=SIZE_CONSISTENCY_BAND):
     return kept_blobs, len(blobs) - len(kept_blobs)
 
 
-SPACING_RANSAC_TOLERANCE = 0.08  # relative-to-base-gap tolerance for the RANSAC spacing check
+
+# Relative-to-base-gap tolerance for the RANSAC spacing check. What this
+# 8% budget covers, on a ~333px base gap (a 150mph driver at the default
+# strobe interval):
+#   - aerodynamic drag decelerating the ball across the frame: ~0.3%
+#   - centroid/moment noise in the position estimate: ~0.3%
+# Both comfortably inside the budget, with room to spare. The unknown is
+# real strobe timing jitter -- it doesn't exist yet, because the strobe
+# is simulated (generate.py fires flashes at an exactly regular
+# interval). If real hardware's timing jitter ever approaches or exceeds
+# ~8% of the base gap, valid shots will start being rejected here as
+# spacing-inconsistent -- this constant is the first thing to revisit
+# once real frames exist to measure actual jitter against.
+SPACING_RANSAC_TOLERANCE = 0.08
 
 
 def _spacing_regularity(sorted_projections, tolerance=SPACING_RANSAC_TOLERANCE):
