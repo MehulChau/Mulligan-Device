@@ -49,6 +49,52 @@ BORDER_SAFETY_PX = 3.0
 # strobe LED, used by the IR falloff model below.
 DEFAULT_FALLOFF_REFERENCE_PX = 300.0
 
+# Effective focal length in pixels, from the same pinhole relation used
+# for SCALE_MM_PER_PX above (f_px = f_mm * sensor_width_px / sensor_width_mm).
+# generate.py itself always draws an ideal, distortion-free pinhole image;
+# this and DEFAULT_CAMERA_MATRIX exist only to define *where* a lens's
+# barrel distortion would move a point, for the optional `distortion`
+# parameter on generate_frame() and for generate_checkerboard_frame().
+FOCAL_LENGTH_PX = LENS_FOCAL_LENGTH_MM / SENSOR_WIDTH_MM * SENSOR_WIDTH_PX
+DEFAULT_CAMERA_MATRIX = [
+    [FOCAL_LENGTH_PX, 0.0, SENSOR_WIDTH_PX / 2.0],
+    [0.0, FOCAL_LENGTH_PX, SENSOR_HEIGHT_PX / 2.0],
+    [0.0, 0.0, 1.0],
+]
+
+
+def _distort_image(image, camera_matrix, dist_coeffs):
+    """Warp a clean, undistorted synthetic image into what a lens with
+    `dist_coeffs` would actually have captured of the same scene.
+
+    There's no direct "distort an image" function in OpenCV, only the
+    inverse (cv2.undistort corrects a real photo). This builds it from
+    cv2.undistortPoints instead: for every pixel in the *output*
+    (distorted) image, find where in the *clean* (undistorted) image it
+    must have come from, then resample there via cv2.remap. That's the
+    exact geometric inverse of cv2.undistort, so undistorting the result
+    afterward with the same camera_matrix/dist_coeffs recovers the
+    original up to interpolation error.
+
+    An earlier version of this distorted each ball's *centre* individually
+    and drew an ordinary undistorted disk there, which is simpler but
+    wrong in a way that matters here: it leaves every feature's *shape*
+    undistorted, which a real lens never would, and cv2.undistort then
+    can't cleanly invert a per-feature shape distortion that was never
+    actually applied -- verified this empirically: undistorting made the
+    measured speed error *worse*, not better. Warping the whole rendered
+    image once, after every ball is drawn, avoids that mismatch entirely.
+    """
+    h, w = image.shape
+    camera_matrix = np.asarray(camera_matrix, dtype=np.float64)
+    dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64)
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    pts = np.stack([xs.ravel(), ys.ravel()], axis=-1).reshape(-1, 1, 2)
+    source_coords = cv2.undistortPoints(pts, camera_matrix, dist_coeffs, P=camera_matrix)
+    map_x = source_coords[:, 0, 0].reshape(h, w).astype(np.float32)
+    map_y = source_coords[:, 0, 1].reshape(h, w).astype(np.float32)
+    return cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR)
+
 
 def _draw_ball(image, cx, cy, radius, value=255):
     """Draw a filled disk with a 1px anti-aliased edge at a sub-pixel centre.
@@ -200,6 +246,9 @@ def generate_frame(
     mat_reflection_pos_px=None,
     clubhead_edge=False,
     missing_flash_index=None,
+    dist_coeffs=None,
+    camera_matrix=None,
+    depth_profile=None,
 ):
     """Draw a grayscale frame with `num_flashes` ball images along a line.
 
@@ -221,38 +270,65 @@ def generate_frame(
         nothing is drawn for it, but unlike an off-frame flash this is a
         mid-sequence gap the ground truth still records, for testing how
         the detector handles an uneven spacing.
+    dist_coeffs / camera_matrix: optional (k1, k2, p1, p2, k3) lens
+        distortion applied to each ball's ideal pinhole position before
+        drawing (camera_matrix defaults to DEFAULT_CAMERA_MATRIX). None
+        (default) draws the same distortion-free pinhole image as always.
+    depth_profile: optional list of `num_flashes` per-flash relative
+        distance factors (1.0 = the nominal CAMERA_DISTANCE_M), for
+        testing a flight where the ball moves toward or away from the
+        camera. Each flash's apparent diameter is scaled by 1/factor, and
+        the pixel gap between consecutive flashes uses the *average* of
+        the two endpoints' scales -- the same rule detect.py's per-blob
+        scale derivation uses -- so the flight is self-consistent at the
+        constant real-world speed the caller asked for. None (default,
+        equivalent to all 1.0) reproduces the original constant-depth
+        behaviour exactly.
 
     Returns (image, ground_truth_dict).
     """
     image = np.zeros((height, width), dtype=np.uint8)
-
-    speed_mps = ball_speed_mph * MPH_TO_MPS
-    speed_px_per_s = (speed_mps * 1000.0) / SCALE_MM_PER_PX
-    speed_mm_per_flash = speed_mps * 1000.0 * (strobe_interval_ms / 1000.0)
-    step_px = speed_mm_per_flash / SCALE_MM_PER_PX
+    if camera_matrix is None:
+        camera_matrix = DEFAULT_CAMERA_MATRIX
 
     angle_rad = math.radians(launch_angle_deg)
     direction = (math.cos(angle_rad), -math.sin(angle_rad))  # y flips: image y increases downward
-    dx_px = step_px * direction[0]
-    dy_px = step_px * direction[1]
 
-    radius_px = BALL_DIAMETER_PX / 2.0
+    speed_mps = ball_speed_mph * MPH_TO_MPS
+    speed_px_per_s = (speed_mps * 1000.0) / SCALE_MM_PER_PX  # used by motion smear only; see note there
+    mm_per_flash = speed_mps * 1000.0 * (strobe_interval_ms / 1000.0)
+
+    if depth_profile is None:
+        depth_profile = [1.0] * num_flashes
+    scales = [SCALE_MM_PER_PX * f for f in depth_profile]
+    radii_px = [(BALL_DIAMETER_MM / 2.0) / s for s in scales]
 
     if start_pos_px is None:
         # Half a ball diameter from the edge, plus a small border-safety
-        # buffer (see BORDER_SAFETY_PX above).
-        margin = radius_px + BORDER_SAFETY_PX
+        # buffer (see BORDER_SAFETY_PX above). num_flashes=0 has no first
+        # radius to key off of, so falls back to the nominal ball size --
+        # the margin is moot either way with nothing to draw.
+        first_radius = radii_px[0] if radii_px else BALL_DIAMETER_PX / 2.0
+        margin = first_radius + BORDER_SAFETY_PX
         start_x = margin
         start_y = height - margin
         start_pos_px = (start_x, start_y)
 
-    centers = []
-    statuses = []
-    for i in range(num_flashes):
-        cx = start_pos_px[0] + i * dx_px
-        cy = start_pos_px[1] + i * dy_px
-        centers.append((cx, cy))
-        statuses.append(_ball_visibility(cx, cy, radius_px, width, height))
+    # Centres in the ideal (undistorted, pinhole) image: constant
+    # real-world mm per flash, converted to pixels via each gap's local
+    # (endpoint-averaged) scale, so the flight is self-consistent under
+    # depth_profile. Everything is drawn at these ideal positions; lens
+    # distortion (if requested) is applied once, as a whole-image warp,
+    # after all drawing is done -- see _distort_image for why that's
+    # correct where distorting each centre individually isn't.
+    centers = [start_pos_px]
+    for i in range(1, num_flashes):
+        local_scale = (scales[i - 1] + scales[i]) / 2.0
+        step_px = mm_per_flash / local_scale
+        prev = centers[-1]
+        centers.append((prev[0] + step_px * direction[0], prev[1] + step_px * direction[1]))
+
+    statuses = [_ball_visibility(cx, cy, r, width, height) for (cx, cy), r in zip(centers, radii_px)]
 
     off_frame_count = statuses.count("off_frame")
     if off_frame_count:
@@ -273,17 +349,25 @@ def generate_frame(
         strobe_source_px = None
         intensities = [255.0] * num_flashes
 
+    # Motion smear uses the nominal (depth_profile-independent) scale --
+    # combining a changing-depth flight with motion smear isn't something
+    # any test exercises, so the small resulting inconsistency (smear
+    # distance not itself depth-scaled) is an accepted simplification
+    # rather than something worth the extra bookkeeping.
     smear_px = speed_px_per_s * (flash_duration_us * 1e-6) if flash_duration_us > 0 else 0.0
 
     balls = []
-    for i, ((cx, cy), status, intensity) in enumerate(zip(centers, statuses, intensities)):
+    for i, ((cx, cy), status, intensity, radius_px) in enumerate(zip(centers, statuses, intensities, radii_px)):
         if i == missing_flash_index:
             # The strobe didn't fire for this exposure: nothing is drawn,
             # but this is a mid-sequence gap, not an off-frame flash --
             # record it distinctly so ground truth still reflects reality.
             balls.append({"center_px": (cx, cy), "status": "misfired", "intensity": 0.0})
             continue
-        balls.append({"center_px": (cx, cy), "status": status, "intensity": intensity})
+        balls.append({
+            "center_px": (cx, cy), "status": status, "intensity": intensity,
+            "diameter_px": radius_px * 2.0,
+        })
         if status == "off_frame":
             continue  # nothing to draw -- it isn't in the image at all
         value = int(round(min(max(intensity, 0.0), 255.0)))
@@ -308,6 +392,9 @@ def generate_frame(
         _draw_clubhead_edge(image)
         distractors.append({"type": "clubhead_edge"})
 
+    if dist_coeffs is not None:
+        image = _distort_image(image, camera_matrix, dist_coeffs)
+
     if noise_sigma > 0:
         noise = np.random.normal(0.0, noise_sigma, image.shape)
         image = np.clip(image.astype(np.float64) + noise, 0.0, 255.0).astype(np.uint8)
@@ -318,17 +405,135 @@ def generate_frame(
         "num_flashes": num_flashes,
         "strobe_interval_ms": strobe_interval_ms,
         "balls": balls,
-        "ball_diameter_px": radius_px * 2.0,
+        "ball_diameter_px": BALL_DIAMETER_PX,
         "scale_mm_per_px": SCALE_MM_PER_PX,
         "image_width": width,
         "image_height": height,
         "noise_sigma": noise_sigma,
         "flash_duration_us": flash_duration_us,
         "smear_px": smear_px,
+        "dist_coeffs": list(dist_coeffs) if dist_coeffs is not None else None,
+        "camera_matrix": camera_matrix if dist_coeffs is not None else None,
+        "depth_profile": depth_profile,
         "ir_falloff": ir_falloff,
         "strobe_source_px": strobe_source_px,
         "distractors": distractors,
         "missing_flash_index": missing_flash_index,
+    }
+    return image, ground_truth
+
+
+_POLY_RENDER_SHIFT = 4  # sub-pixel fixed-point bits for cv2.fillPoly, see _fill_poly_subpixel
+
+
+def _fill_poly_subpixel(image, quad_px, color):
+    """cv2.fillPoly requires integer points; naively rounding each corner
+    to the nearest pixel before filling adds up to ~0.5px of noise per
+    corner, which is exactly the kind of error a calibration recovery
+    test can't afford (early testing showed it measurably corrupting the
+    recovered distortion coefficients). cv2.fillPoly's `shift` parameter
+    takes coordinates pre-multiplied by 2**shift and rounds once at that
+    finer resolution instead, at effectively full float precision for a
+    16x (shift=4) finer grid.
+    """
+    factor = 1 << _POLY_RENDER_SHIFT
+    pts = np.round(np.asarray([quad_px], dtype=np.float64) * factor).astype(np.int32)
+    cv2.fillPoly(image, pts, color, lineType=cv2.LINE_AA, shift=_POLY_RENDER_SHIFT)
+
+
+def generate_checkerboard_frame(
+    pattern_size=(9, 6),
+    square_size_mm=25.0,
+    board_distance_m=CAMERA_DISTANCE_M,
+    board_tilt_deg=(0.0, 0.0),
+    board_offset_mm=(0.0, 0.0),
+    dist_coeffs=None,
+    camera_matrix=None,
+    width=SENSOR_WIDTH_PX,
+    height=SENSOR_HEIGHT_PX,
+):
+    """Draw one synthetic photo of a checkerboard held at a given pose in
+    front of the camera, optionally through the same lens distortion
+    generate_frame() uses, so calibrate.py can be tested with no camera.
+
+    `pattern_size` is OpenCV's own convention -- the number of *internal*
+    corners (cols, rows), where 4 squares meet -- so it can be passed
+    straight through to cv2.findChessboardCorners. A board with that many
+    internal corners has (cols+1, rows+1) total squares.
+
+    A real calibration needs the board photographed at *varied angles*,
+    not just varied positions: a fronto-parallel board photographed only
+    at different image positions/scales under-constrains the fit (focal
+    length and distortion trade off against each other; verified this
+    empirically -- it recovers a self-consistent but badly wrong camera
+    matrix and distortion with no warning). `board_tilt_deg` (rotation
+    about the board's own x and y axes, i.e. tilting it away from the
+    camera) is what breaks that degeneracy, exactly as it does for a
+    person moving a real board in front of a real camera.
+
+    The board is modeled as a real, physical, planar object at
+    `board_distance_m` along the camera axis (plus `board_offset_mm`
+    lateral shift and `board_tilt_deg` rotation) and projected with
+    cv2.projectPoints -- the same operation, run forward, that
+    cv2.calibrateCamera solves the inverse of -- rather than warping a
+    flat image, so perspective and lens distortion combine correctly.
+
+    Returns (image, ground_truth_dict) with the object-space (mm) and
+    true image-space (px, undistorted and distorted) position of every
+    internal corner, plus the pose and camera model used to produce them.
+    """
+    if camera_matrix is None:
+        camera_matrix = DEFAULT_CAMERA_MATRIX
+    camera_matrix_np = np.array(camera_matrix, dtype=np.float64)
+    dist_np = np.array(dist_coeffs, dtype=np.float64) if dist_coeffs is not None else np.zeros(5)
+
+    squares_x, squares_y = pattern_size[0] + 1, pattern_size[1] + 1
+    xs_mm = (np.arange(squares_x + 1) - squares_x / 2.0) * square_size_mm
+    ys_mm = (np.arange(squares_y + 1) - squares_y / 2.0) * square_size_mm
+    grid_mm = np.array([[x, y, 0.0] for y in ys_mm for x in xs_mm], dtype=np.float64)
+
+    tilt_x_rad, tilt_y_rad = math.radians(board_tilt_deg[0]), math.radians(board_tilt_deg[1])
+    rx = np.array([[1, 0, 0], [0, math.cos(tilt_x_rad), -math.sin(tilt_x_rad)],
+                   [0, math.sin(tilt_x_rad), math.cos(tilt_x_rad)]])
+    ry = np.array([[math.cos(tilt_y_rad), 0, math.sin(tilt_y_rad)], [0, 1, 0],
+                   [-math.sin(tilt_y_rad), 0, math.cos(tilt_y_rad)]])
+    rvec, _ = cv2.Rodrigues(ry @ rx)
+    tvec = np.array([board_offset_mm[0], board_offset_mm[1], board_distance_m * 1000.0])
+
+    grid_distorted, _ = cv2.projectPoints(grid_mm, rvec, tvec, camera_matrix_np, dist_np)
+    grid_distorted = grid_distorted.reshape(len(ys_mm), len(xs_mm), 2)
+    grid_undistorted, _ = cv2.projectPoints(grid_mm, rvec, tvec, camera_matrix_np, np.zeros(5))
+    grid_undistorted = grid_undistorted.reshape(len(ys_mm), len(xs_mm), 2)
+
+    image = np.full((height, width), 255, dtype=np.uint8)
+    for row in range(squares_y):
+        for col in range(squares_x):
+            if (row + col) % 2 == 0:
+                continue  # alternate squares: leave the white background showing
+            quad = [grid_distorted[row, col], grid_distorted[row, col + 1],
+                    grid_distorted[row + 1, col + 1], grid_distorted[row + 1, col]]
+            _fill_poly_subpixel(image, quad, 0)
+
+    corners_mm, corners_undistorted_px, corners_distorted_px = [], [], []
+    for row in range(1, squares_y):
+        for col in range(1, squares_x):
+            corners_mm.append((float(xs_mm[col]), float(ys_mm[row])))
+            corners_undistorted_px.append(tuple(grid_undistorted[row, col]))
+            corners_distorted_px.append(tuple(grid_distorted[row, col]))
+
+    ground_truth = {
+        "pattern_size": list(pattern_size),
+        "square_size_mm": square_size_mm,
+        "board_distance_m": board_distance_m,
+        "board_tilt_deg": list(board_tilt_deg),
+        "board_offset_mm": list(board_offset_mm),
+        "camera_matrix": camera_matrix,
+        "dist_coeffs": list(dist_coeffs) if dist_coeffs is not None else None,
+        "corners_object_mm": corners_mm,
+        "corners_undistorted_px": corners_undistorted_px,
+        "corners_distorted_px": corners_distorted_px,
+        "image_width": width,
+        "image_height": height,
     }
     return image, ground_truth
 

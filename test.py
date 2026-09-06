@@ -5,10 +5,14 @@ Exits non-zero if any case exceeds the error threshold.
 """
 
 import math
+import os
 import sys
+import tempfile
 
+import cv2
 import numpy as np
 
+import calibrate
 import generate
 from generate import generate_frame
 import detect
@@ -268,7 +272,6 @@ def _contour_survives_filters(image):
     finder uses, over every contour that isn't a real ball's, and return
     info for the largest one (the distractor, assuming just one is
     present) -- or None if nothing but real balls was found."""
-    import cv2
     _, binary = cv2.threshold(image, 40, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     max_area_px = 0.05 * image.shape[0] * image.shape[1]
@@ -462,6 +465,133 @@ def check_missing_flash():
     return passed
 
 
+CALIBRATION_TEST_POSES = [
+    # (board_distance_m, board_tilt_deg, board_offset_mm) -- varied *angle*
+    # is what actually constrains the fit; fronto-parallel photos at only
+    # varied positions/scales under-constrain it (verified empirically:
+    # it recovers a self-consistent but badly wrong camera matrix with no
+    # warning -- focal length and distortion trade off against each other
+    # without real perspective to break the tie).
+    (0.5, (0, 0), (0, 0)), (0.5, (25, 0), (0, 0)), (0.5, (-25, 0), (0, 0)),
+    (0.5, (0, 25), (0, 0)), (0.5, (0, -25), (0, 0)),
+    (0.45, (20, 20), (-100, -80)), (0.45, (20, -20), (100, -80)),
+    (0.45, (-20, 20), (-100, 80)), (0.45, (-20, -20), (100, 80)),
+    (0.6, (15, 15), (150, 100)), (0.55, (10, -10), (-150, 100)),
+    (0.35, (0, 0), (0, 0)), (0.7, (0, 0), (0, 0)),
+]
+
+
+def check_calibration_recovers_distortion():
+    """Generate synthetic checkerboards at varied poses, run calibrate.py's
+    pipeline against them, and confirm it recovers the known distortion
+    coefficients and focal length."""
+    true_dist = (-0.15, 0.05, 0.0, 0.0, 0.0)
+    pattern_size = (9, 6)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        image_paths = []
+        for i, (dist_m, tilt, offset) in enumerate(CALIBRATION_TEST_POSES):
+            img, _ = generate.generate_checkerboard_frame(
+                pattern_size=pattern_size, board_distance_m=dist_m,
+                board_tilt_deg=tilt, board_offset_mm=offset, dist_coeffs=true_dist,
+            )
+            path = os.path.join(tmpdir, f"board_{i:02d}.png")
+            cv2.imwrite(path, img)
+            image_paths.append(path)
+
+        result = calibrate.calibrate(image_paths, pattern_size, square_size_mm=25.0,
+                                      max_reprojection_error_px=1.0)
+
+    recovered_dist = result["dist_coeffs"]
+    k1_err = abs(recovered_dist[0] - true_dist[0])
+    k2_err = abs(recovered_dist[1] - true_dist[1])
+    fx_err_pct = abs(result["camera_matrix"][0][0] - generate.FOCAL_LENGTH_PX) / generate.FOCAL_LENGTH_PX * 100.0
+
+    print(f"calibration recovery: reprojection error {result['reprojection_error_px']:.4f}px, "
+          f"k1={recovered_dist[0]:.4f} (true {true_dist[0]}), "
+          f"k2={recovered_dist[1]:.4f} (true {true_dist[1]}), "
+          f"focal length error {fx_err_pct:.3f}%")
+
+    passed = k1_err < 0.02 and k2_err < 0.03 and fx_err_pct < 1.0
+    print("PASS" if passed else "FAIL")
+    return passed
+
+
+def check_undistortion_reduces_speed_error():
+    """A ball frame shot through a distorted lens should show measurable
+    speed error; undistorting it with the true calibration should reduce
+    that error. k1=-0.10 corresponds to roughly 3% displacement at the
+    frame corner -- a realistic cheap-lens barrel distortion level, not a
+    worst case (see calibrate.py's own edge_shift_px)."""
+    speed_mph, angle_deg, num_flashes = 150.0, 12.0, 4
+    true_dist = (-0.10, 0.0, 0.0, 0.0, 0.0)
+    start_pos = (400.0, 850.0)  # flight ends near the right edge, where distortion matters most
+
+    image_dist, truth_dist = generate_frame(
+        speed_mph, angle_deg, num_flashes=num_flashes, start_pos_px=start_pos, dist_coeffs=true_dist,
+    )
+    uncorrected = measure(image_dist, truth_dist["strobe_interval_ms"])
+    assert uncorrected is not None, "detector failed on a distorted frame"
+    uncorrected_err = abs(uncorrected["ball_speed_mph"] - speed_mph) / speed_mph * 100.0
+
+    calibration = {"camera_matrix": generate.DEFAULT_CAMERA_MATRIX, "dist_coeffs": list(true_dist)}
+    corrected = measure(image_dist, truth_dist["strobe_interval_ms"], calibration=calibration)
+    assert corrected is not None, "detector failed on the undistorted frame"
+    corrected_err = abs(corrected["ball_speed_mph"] - speed_mph) / speed_mph * 100.0
+
+    print(f"barrel distortion (k1={true_dist[0]}): uncorrected speed error {uncorrected_err:.3f}%, "
+          f"corrected {corrected_err:.4f}%, calibration_applied={corrected['calibration_applied']}")
+
+    passed = corrected_err < uncorrected_err and corrected_err <= SPEED_ERROR_THRESHOLD_PCT
+    print("PASS" if passed else "FAIL")
+    return passed
+
+
+def check_per_blob_scale_depth_varying():
+    """A flight where the ball's distance from the camera changes (moving
+    toward or away, not just laterally), so its apparent diameter changes
+    across the frame -- exactly what a real 3D trajectory does that this
+    project's flat-scale model otherwise ignores. Deriving scale per blob
+    and averaging the two endpoint scales for each gap should measure
+    this correctly; a single global mean scale, applied everywhere,
+    should not.
+
+    ~9% depth change by the last flash is a realistic upper bound for
+    this camera's geometry (2 feet to the side, most of the flight
+    parallel to the sensor) -- and conveniently, also about the most the
+    RANSAC line fit's spacing tolerance can absorb before it starts
+    finding the depth-varying (but perfectly genuine) pixel spacing
+    inconsistent with a single flash interval; see
+    docs/hardware-readiness.md.
+    """
+    speed_mph, angle_deg, num_flashes = 150.0, 12.0, 4
+    depth_profile = [1.0, 1.03, 1.06, 1.09]  # ball moving away across the frame
+    image, truth = generate_frame(speed_mph, angle_deg, num_flashes=num_flashes, depth_profile=depth_profile)
+
+    result = measure(image, truth["strobe_interval_ms"])
+    assert result is not None, "detector failed on a depth-varying flight"
+    new_err_pct = abs(result["ball_speed_mph"] - speed_mph) / speed_mph * 100.0
+
+    # Reconstruct what a single-global-mean-scale approach would have
+    # given, for comparison: one scale from the mean diameter, applied to
+    # the mean pixel spacing -- measure()'s behavior before per-blob
+    # scale replaced it.
+    old_scale = generate.BALL_DIAMETER_MM / result["mean_diameter_px"]
+    centers = np.array(result["ball_centers"])
+    pixel_spacings = np.linalg.norm(np.diff(centers, axis=0), axis=1)
+    old_speed_mps = (float(np.mean(pixel_spacings)) * old_scale / 1000.0) / (truth["strobe_interval_ms"] / 1000.0)
+    old_speed_mph = old_speed_mps / generate.MPH_TO_MPS
+    old_err_pct = abs(old_speed_mph - speed_mph) / speed_mph * 100.0
+
+    print(f"depth-varying flight (per-blob scale {result['per_blob_scales_mm_per_px'][0]:.4f} -> "
+          f"{result['per_blob_scales_mm_per_px'][-1]:.4f} mm/px): "
+          f"mean-scale err={old_err_pct:.4f}%, per-blob-scale err={new_err_pct:.4f}%")
+
+    passed = new_err_pct < old_err_pct and new_err_pct <= SPEED_ERROR_THRESHOLD_PCT
+    print("PASS" if passed else "FAIL")
+    return passed
+
+
 def check_missing_flash_low_confidence_with_3_balls():
     """With only 3 balls (2 gaps), spacing_consistency is a noisy
     statistic and the minimum-of-2 is itself biased low -- the min-spacing
@@ -534,10 +664,17 @@ def main():
     overlap_ok = check_overlapping_balls_fail_safely()
     print()
     no_ball_ok = check_no_ball_frame()
+    print()
+    calibration_recovery_ok = check_calibration_recovers_distortion()
+    print()
+    undistortion_ok = check_undistortion_reduces_speed_error()
+    print()
+    per_blob_scale_ok = check_per_blob_scale_depth_varying()
 
     if not (sweep_ok and clip_ok and noise_ok and smear_ok and falloff_ok and combined_ok
             and distractors_ok and distractors_combined_ok and online_distractor_ok
-            and missing_flash_ok and low_confidence_ok and overlap_ok and no_ball_ok):
+            and missing_flash_ok and low_confidence_ok and overlap_ok and no_ball_ok
+            and calibration_recovery_ok and undistortion_ok and per_blob_scale_ok):
         sys.exit(1)
 
 

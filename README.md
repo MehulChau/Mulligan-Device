@@ -8,20 +8,23 @@ does not compute carry distance — a separate app owns that.
 ## Status
 
 **Real:** the detection pipeline (`detect.py`) and everything in it — thresholding, size-consistency
-filtering, the spacing-aware RANSAC line fit, the perpendicular-extent scale derivation, the missing-
-flash correction. The accuracy numbers in this README and in `test.py` are measured, not aspirational.
-The device protocol server (`server.py`) is a real, working WebSocket server speaking real protocol
-v1.1 — verified end-to-end against the actual app (tag `e2e`): `hello`/`bootId` accepted, a `shot`
-produced a ball flight with correct provenance.
+filtering, the spacing-aware RANSAC line fit, the per-blob perpendicular-extent scale derivation, the
+missing-flash correction, and lens-distortion correction (`calibrate.py` + `detect.py`'s optional
+`calibration` argument). The accuracy numbers in this README and in `test.py` are measured, not
+aspirational. The device protocol server (`server.py`) is a real, working WebSocket server speaking
+real protocol v1.1 — verified end-to-end against the actual app (tag `e2e`): `hello`/`bootId` accepted,
+a `shot` produced a ball flight with correct provenance.
 
 **Synthetic:** every frame `detect.py` has ever measured, including the one behind that end-to-end
 verification, was drawn by `generate.py`, not captured by a camera. There is no camera. There is no
-strobe. There is no GPIO. `server.py` calling `generate.generate_frame()` on a keypress is a stand-in
-for hardware that doesn't exist yet, not a simulation of one — the detection and protocol code
-downstream of that frame is the exact code that will run against a real photograph.
+strobe. There is no GPIO. `calibrate.py` has recovered known distortion coefficients only from a
+synthetic checkerboard, never a printed one photographed by a real lens. `server.py` calling
+`generate.generate_frame()` on a keypress is a stand-in for hardware that doesn't exist yet, not a
+simulation of one — the detection and protocol code downstream of that frame is the exact code that
+will run against a real photograph.
 
-Next work here is hardware bring-up, not software: build the camera/strobe rig, get one real frame,
-and see how much of the above still holds.
+Next work here is hardware bring-up, not software: build the camera/strobe rig, get one real frame
+(see `docs/hardware-readiness.md`), and see how much of the above still holds.
 
 ## The strobe concept
 
@@ -50,8 +53,14 @@ enough to true over two feet of flight that gravity and drag don't matter yet.
 - `server.py` — the device side of `docs/device-protocol.md`: a WebSocket server the app connects to,
   emitting a `shot` (measured by the real generate.py/detect.py pipeline against a synthetic frame) on
   a keypress.
+- `calibrate.py` — recovers camera matrix and lens distortion coefficients from checkerboard photos;
+  see `docs/calibration.md`.
 - `docs/device-protocol.md` — the app/device contract. Canonical copy lives in the app repo; this is a
   mirror kept for local reference. See the file's own header before editing it.
+- `docs/calibration.md` — what to print and photograph, and how to run `calibrate.py`.
+- `docs/hardware-readiness.md` — what to revisit once real frames exist: tunable constants picked
+  against synthetic images, assumptions the generator makes that reality won't, and the recommended
+  first real test.
 
 Everything runs on a laptop. No camera capture, no GPIO, no strobe hardware control, no ball flight
 simulation — those come later. The device protocol server is real, but its shots are synthetic until
@@ -72,8 +81,10 @@ python test.py       # run the full accuracy sweep; exits non-zero on failure
 `generate_frame()` also accepts `noise_sigma` (Gaussian sensor noise), `flash_duration_us` (motion
 smear from a non-instantaneous flash), `ir_falloff` (inverse-square dimming with distance from the
 strobe), `laser_dot` / `mat_reflection` / `clubhead_edge` (distractors a real range frame can contain),
-and `missing_flash_index` (a strobe pulse that didn't fire) to exercise the detector against harder,
-more realistic frames.
+`missing_flash_index` (a strobe pulse that didn't fire), `dist_coeffs`/`camera_matrix` (lens distortion,
+applied as a whole-frame warp after drawing), and `depth_profile` (a per-flash relative distance factor,
+for a flight where the ball moves toward or away from the camera) to exercise the detector against
+harder, more realistic frames.
 
 `laser_dot` and an isolated round `mat_reflection` both survive detect.py's basic per-blob filters
 (area, circularity, border) -- neither checks a candidate's size against the expected ball diameter.
@@ -98,6 +109,16 @@ that line rather than its raw diameter or area. This self-calibrates on every sh
 distance stops mattering) and stays accurate even when motion smear stretches each ball image along
 its direction of travel, since smear doesn't affect the perpendicular extent.
 
+The ball doesn't stay at a constant distance from the camera in reality — it's moving in three
+dimensions, so its apparent size shifts across the frame, and each ball's own diameter already tells you
+its own distance. `detect.py` derives a scale *per blob* rather than one global mean, and converts each
+gap between consecutive balls using the average of its two endpoint scales, so real depth change is
+absorbed instead of averaged away. `measure()`'s result includes `per_blob_scales_mm_per_px` and
+`scale_spread_mm_per_px` — a spread that's a useful diagnostic on real hardware, since a large one means
+either genuine depth change or a detection problem. A single blob whose scale is wildly out of line with
+the rest (`scale_outlier_blobs`) is treated as a bad measurement rather than real depth change, and
+falls back to the median scale for that blob alone.
+
 Segmentation uses an adaptive, descending sequence of thresholds rather than one fixed cutoff, so a
 ball dimmed by IR falloff (farther from the strobe) can still be found even when a brighter, closer
 ball in the same frame would saturate a threshold tuned for the dim one. The threshold sequence is
@@ -115,6 +136,17 @@ flash still passes). Collinearity alone isn't enough -- a distractor that happen
 line (a laser dot marking the address position, say) would pass a collinearity-only test trivially;
 it's the spacing check that catches it, since its position along the line rarely lines up with the
 flash timing.
+
+## Camera calibration
+
+A cheap wide-FOV lens shows real barrel distortion toward the edges, and since ball images span nearly
+the full frame width, that distortion corrupts the spacing between them directly. `calibrate.py` recovers
+a camera matrix and distortion coefficients from checkerboard photos (see `docs/calibration.md` for what
+to print and photograph); `detect.py`'s optional `calibration` argument undistorts a frame before
+detection using the result. Both are fully testable synthetically: `generate_frame()` and
+`generate_checkerboard_frame()` accept the same `dist_coeffs`/`camera_matrix`, so `test.py` generates a
+distorted checkerboard, confirms `calibrate.py` recovers the known coefficients, then generates a
+distorted ball frame and confirms undistorting it measurably reduces speed error.
 
 ## Running the device server
 
